@@ -343,7 +343,7 @@ def _make_handler(tool_name: str, param_schema: dict[str, Any] | None, sandbox: 
 
 
 # ── Allowlist / Denylist ──────────────────────────────────────────────
-# Force-blocked: dangerous tools never exposed by default
+# Force-blocked: dangerous tools NEVER exposed (hardcoded, not env-overridable)
 _FORCE_BLOCKED_TOOLS: frozenset[str] = frozenset(
     {
         "terminal_execute",
@@ -354,10 +354,39 @@ _FORCE_BLOCKED_TOOLS: frozenset[str] = frozenset(
     }
 )
 
-# Optional allowlist: if non-empty, only these tools are exposed
+# Default safe allowlist (read-only / analysis-only tools)
+_DEFAULT_ALLOWED: frozenset[str] = frozenset(
+    {
+        "list_files",
+        "search_files",
+        "view_request",
+        "view_sitemap_entry",
+        "list_requests",
+        "list_sitemap",
+        "think",
+        "create_note",
+        "list_notes",
+        "get_note",
+        "update_note",
+        "delete_note",
+        "create_todo",
+        "list_todos",
+        "update_todo",
+        "mark_todo_done",
+        "mark_todo_pending",
+        "delete_todo",
+        "create_vulnerability_report",
+        "view_agent_graph",
+        "wait_for_message",
+    }
+)
+
+# Allowlist: env var overrides default, or empty = use default
 _ALLOWED_TOOLS_ENV = os.getenv("STRIX_MCP_ALLOWED_TOOLS", "")
-_ALLOWED_TOOLS: frozenset[str] | None = (
-    frozenset(t.strip() for t in _ALLOWED_TOOLS_ENV.split(",") if t.strip()) if _ALLOWED_TOOLS_ENV else None
+_ALLOWED_TOOLS: frozenset[str] = (
+    frozenset(t.strip() for t in _ALLOWED_TOOLS_ENV.split(",") if t.strip())
+    if _ALLOWED_TOOLS_ENV
+    else _DEFAULT_ALLOWED
 )
 
 # Override force-blocked (e.g. STRIX_MCP_FORCE_BLOCKED_TOOLS="terminal_execute,browser_action")

@@ -1,31 +1,24 @@
 """
-Strix MCP Server v0.2.0a1 — Expose a curated subset of Strix tools via MCP.
+Strix MCP Server — Expose Strix tools via Model Context Protocol.
 
-SECURITY MODEL
-==============
-- Lazy loading: Strix registry loaded only in main(), not at import time
-- Zero exec(): All handlers use closures via _make_handler()
-- Strict validation: _sanitize_param_value raises on invalid types
-- Allowlist/Denylist: Force-blocked dangerous tools, optional explicit allowlist
+Reads the Strix tool registry and exposes each registered tool as an MCP tool.
+Handles execution routing (local vs sandbox via ToolServer).
 """
 
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import logging
 import os
 import sys
-import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
 
 # ── Paths ──────────────────────────────────────────────────────────────
-STRIX_REPO = Path(os.getenv("STRIX_REPO", "./strix"))
+STRIX_REPO = Path(os.getenv("STRIX_REPO", "./strix"))  # Path to Strix repo (set env var)
 sys.path.insert(0, str(STRIX_REPO))
 
 # ── Config ─────────────────────────────────────────────────────────────
@@ -35,8 +28,8 @@ SANDBOX_AGENT_ID = os.getenv("STRIX_SANDBOX_AGENT_ID", "default")
 
 # ── Rate limiting ──────────────────────────────────────────────────────
 _rate_limit_window: dict[str, list[float]] = {}
-_RATE_LIMIT_MAX = 100
-_RATE_LIMIT_WINDOW = 60
+_RATE_LIMIT_MAX = 100  # requests per window
+_RATE_LIMIT_WINDOW = 60  # seconds
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("strix-mcp")
@@ -44,10 +37,11 @@ logger = logging.getLogger("strix-mcp")
 # ── Server ─────────────────────────────────────────────────────────────
 mcp = FastMCP(
     name="strix-mcp-server",
-    instructions="Exposes Strix penetration testing tools via MCP with allowlist-based security.",
+    instructions="Exposes Strix penetration testing tools via MCP. Tools include nmap scanning, vulnerability detection, web probing, subdomain enumeration, and more.",
 )
 
-# ── Registry loader (lazy) ────────────────────────────────────────────
+# ── Registry loader ────────────────────────────────────────────────────
+# Global storage for tool entries (functions can't be serialized in exec)
 _TOOL_ENTRIES: dict[str, dict[str, Any]] = {}
 _REGISTRY_CACHE: list[dict[str, Any]] | None = None
 
@@ -68,18 +62,19 @@ def _load_registry() -> list[dict[str, Any]]:
         _REGISTRY_CACHE = tools  # type: ignore[list-item]
         return _REGISTRY_CACHE
     except ImportError as e:
-        logger.warning(f"Strix registry not importable (expected outside sandbox): {e}")
+        logger.warning(f"Strix registry not importable (expected if running outside sandbox): {e}")
         _REGISTRY_CACHE = []
         return []
 
 
 # ── XML description parser ─────────────────────────────────────────────
 def _parse_xml_description(xml_schema: str) -> str:
-    """Extract description from XML schema, stripping malformed <examples> section."""
+    """Extract description from XML schema string, handling malformed examples section."""
     if not xml_schema:
         return ""
 
     try:
+        # Strip the <examples> section to avoid parsing errors from malformed XML
         clean = xml_schema
         examples_start = clean.find("<examples>")
         examples_end = clean.find("</examples>")
@@ -90,23 +85,33 @@ def _parse_xml_description(xml_schema: str) -> str:
 
         root = ET.fromstring(clean)
 
+        # Navigate <tools> -> <tool> hierarchy
         tools_elem = root.find("tools")
-        tool_elem = tools_elem.find("tool") if tools_elem is not None else root.find("tool")
+        if tools_elem is not None:
+            tool_elem = tools_elem.find("tool")
+        else:
+            tool_elem = root.find("tool")
 
         if tool_elem is not None:
             parts = []
-            for tag in ("description", "details", "notes"):
-                elem = tool_elem.find(tag)
-                if elem is not None and elem.text:
-                    prefix = "\n\n" + tag.capitalize() + ":\n" if tag != "description" else ""
-                    parts.append(prefix + elem.text.strip())
+            desc_elem = tool_elem.find("description")
+            if desc_elem is not None and desc_elem.text:
+                parts.append(desc_elem.text.strip())
+            details_elem = tool_elem.find("details")
+            if details_elem is not None and details_elem.text:
+                parts.append("\n\nDetails:\n" + details_elem.text.strip())
+            notes_elem = tool_elem.find("notes")
+            if notes_elem is not None and notes_elem.text:
+                parts.append("\n\nNotes:\n" + notes_elem.text.strip())
             if parts:
-                return "".join(parts)
+                return "\n".join(parts)
 
+        # Direct <description> element (no wrapper)
         desc = root.find("description")
         if desc is not None and desc.text:
             return desc.text.strip()
 
+        # Fallback: regex extraction
         import re
 
         desc_match = re.search(r"<description>(.*?)</description>", clean, re.DOTALL)
@@ -118,7 +123,7 @@ def _parse_xml_description(xml_schema: str) -> str:
     return ""
 
 
-# ── Parameter helpers ──────────────────────────────────────────────────
+# ── Parameter schema helpers ───────────────────────────────────────────
 def _get_param_schema(tool_name: str) -> dict[str, Any] | None:
     """Get parameter schema for a tool by name."""
     try:
@@ -129,42 +134,26 @@ def _get_param_schema(tool_name: str) -> dict[str, Any] | None:
         return None
 
 
-class ParamValidationError(ValueError):
-    """Raised when a parameter fails type validation."""
-
-    pass
-
-
 def _sanitize_param_value(value: Any, expected_type: str) -> Any:
-    """Sanitize a parameter value to expected type. Raises ParamValidationError on invalid."""
+    """Sanitize a parameter value to expected type. Raises ValueError on invalid coercion."""
     if value is None:
         return None
-
     if expected_type == "string":
         return str(value) if not isinstance(value, str) else value
-
     if expected_type == "integer":
         try:
             return int(value)
         except (ValueError, TypeError):
-            raise ParamValidationError(f"Expected integer, got {type(value).__name__}: {value!r}")
-
+            raise ValueError(f"Expected integer, got {type(value).__name__}: {value!r}")
     if expected_type == "number":
         try:
             return float(value)
         except (ValueError, TypeError):
-            raise ParamValidationError(f"Expected number, got {type(value).__name__}: {value!r}")
-
+            raise ValueError(f"Expected number, got {type(value).__name__}: {value!r}")
     if expected_type == "boolean":
         if isinstance(value, bool):
             return value
-        lowered = str(value).lower()
-        if lowered in ("true", "1", "yes"):
-            return True
-        if lowered in ("false", "0", "no"):
-            return False
-        raise ParamValidationError(f"Expected boolean, got {value!r}")
-
+        return str(value).lower() in ("true", "1", "yes")
     if expected_type == "array":
         if isinstance(value, list):
             return value
@@ -174,9 +163,8 @@ def _sanitize_param_value(value: Any, expected_type: str) -> Any:
                 if isinstance(parsed, list):
                     return parsed
             except (json.JSONDecodeError, TypeError):
-                pass
-        raise ParamValidationError(f"Expected array, got {type(value).__name__}: {value!r}")
-
+                raise ValueError(f"Expected array, got invalid JSON string: {value!r}")
+        return [value] if value else []
     if expected_type == "object":
         if isinstance(value, dict):
             return value
@@ -186,15 +174,16 @@ def _sanitize_param_value(value: Any, expected_type: str) -> Any:
                 if isinstance(parsed, dict):
                     return parsed
             except (json.JSONDecodeError, TypeError):
-                pass
-        raise ParamValidationError(f"Expected object, got {type(value).__name__}: {value!r}")
-
+                raise ValueError(f"Expected object, got invalid JSON string: {value!r}")
+        return {}
     return value
 
 
 def _get_param_type(func: Any, param_name: str) -> str:
     """Infer JSON schema type from Python function signature."""
     try:
+        import inspect
+
         sig = inspect.signature(func)
         if param_name not in sig.parameters:
             return "string"
@@ -221,11 +210,14 @@ def _get_param_type(func: Any, param_name: str) -> str:
 
 # ── Rate limiting ──────────────────────────────────────────────────────
 def _check_rate_limit(tool_name: str) -> bool:
-    """Check if tool call is within rate limit."""
+    """Check if tool call is within rate limit. Returns True if allowed."""
+    import time
+
     now = time.time()
     key = f"tool:{tool_name}"
     if key not in _rate_limit_window:
         _rate_limit_window[key] = []
+    # Clean old entries
     _rate_limit_window[key] = [t for t in _rate_limit_window[key] if now - t < _RATE_LIMIT_WINDOW]
     if len(_rate_limit_window[key]) >= _RATE_LIMIT_MAX:
         return False
@@ -251,10 +243,6 @@ async def _execute_sandbox(tool_name: str, kwargs: dict[str, Any]) -> Any:
     import httpx
 
     url = f"{SANDBOX_URL}/execute"
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError(f"Invalid sandbox URL scheme: {parsed.scheme}")
-
     headers = {
         "Authorization": f"Bearer {SANDBOX_TOKEN}",
         "Content-Type": "application/json",
@@ -281,6 +269,7 @@ async def _execute_local(tool_entry: dict[str, Any], kwargs: dict[str, Any]) -> 
     if not tool_func:
         raise RuntimeError(f"Tool '{tool_name}' has no function")
 
+    # Convert arguments using Strix's argument parser
     try:
         from strix.tools.argument_parser import convert_arguments
 
@@ -288,7 +277,10 @@ async def _execute_local(tool_entry: dict[str, Any], kwargs: dict[str, Any]) -> 
     except Exception:
         converted = kwargs
 
+    # Check if tool needs agent_state
     try:
+        import inspect
+
         sig = inspect.signature(tool_func)
         if "agent_state" in sig.parameters:
             converted["agent_state"] = None
@@ -301,14 +293,15 @@ async def _execute_local(tool_entry: dict[str, Any], kwargs: dict[str, Any]) -> 
     return result
 
 
-# ── Handler factory (zero exec) ────────────────────────────────────────
+# ── Generic handler factory (replaces exec()) ─────────────────────────
 def _make_handler(tool_name: str, param_schema: dict[str, Any] | None, sandbox: bool) -> Any:
-    """Create a tool handler via closure. No exec(), no f-string interpolation."""
+    """Create a tool handler without exec(). Uses closure to capture metadata."""
 
     async def handler(**kwargs: Any) -> dict[str, Any]:
         """Execute a Strix tool via MCP."""
         logger.info(f"Executing tool '{tool_name}' via MCP (sandbox={sandbox}, kwargs={list(kwargs.keys())})")
 
+        # Validate required params
         if param_schema and param_schema.get("has_params"):
             required = param_schema.get("required", set())
             for req_param in required:
@@ -342,59 +335,14 @@ def _make_handler(tool_name: str, param_schema: dict[str, Any] | None, sandbox: 
     return handler
 
 
-# ── Allowlist / Denylist ──────────────────────────────────────────────
-# Force-blocked: dangerous tools never exposed by default
-_FORCE_BLOCKED_TOOLS: frozenset[str] = frozenset(
-    {
-        "terminal_execute",
-        "python_action",
-        "browser_action",
-        "str_replace_editor",
-        "send_request",
-    }
-)
-
-# Optional allowlist: if non-empty, only these tools are exposed
-_ALLOWED_TOOLS_ENV = os.getenv("STRIX_MCP_ALLOWED_TOOLS", "")
-_ALLOWED_TOOLS: frozenset[str] | None = (
-    frozenset(t.strip() for t in _ALLOWED_TOOLS_ENV.split(",") if t.strip()) if _ALLOWED_TOOLS_ENV else None
-)
-
-# Override force-blocked (e.g. STRIX_MCP_FORCE_BLOCKED_TOOLS="terminal_execute,browser_action")
-_FORCE_BLOCKED_OVERRIDE_ENV = os.getenv("STRIX_MCP_FORCE_BLOCKED_TOOLS", "")
-_FORCE_BLOCKED_OVERRIDE_SET: frozenset[str] | None = (
-    frozenset(t.strip() for t in _FORCE_BLOCKED_OVERRIDE_ENV.split(",") if t.strip())
-    if _FORCE_BLOCKED_OVERRIDE_ENV
-    else None
-)
-
-
-def _is_tool_allowed(tool_name: str) -> tuple[bool, str]:
-    """Check if a tool is allowed. Returns (allowed, reason)."""
-    # 1. Check force-blocked (unless overridden)
-    if tool_name in _FORCE_BLOCKED_TOOLS:
-        if _FORCE_BLOCKED_OVERRIDE_SET and tool_name in _FORCE_BLOCKED_OVERRIDE_SET:
-            return True, "unblocked by STRIX_MCP_FORCE_BLOCKED_TOOLS"
-        return False, f"force-blocked (add to STRIX_MCP_FORCE_BLOCKED_TOOLS to unblock)"
-
-    # 2. Check allowlist (if set)
-    if _ALLOWED_TOOLS and tool_name not in _ALLOWED_TOOLS:
-        return False, f"not in STRIX_MCP_ALLOWED_TOOLS allowlist"
-
-    return True, ""
-
-
 # ── MCP Tools ──────────────────────────────────────────────────────────
 def _register_tools():
-    """Register allowed Strix tools as MCP tools."""
+    """Register all Strix tools as MCP tools."""
     registry = _load_registry()
 
     if not registry:
         logger.info("No Strix tools found in registry. Server will expose discovery tools only.")
         return
-
-    registered_count = 0
-    skipped_count = 0
 
     for tool_entry in registry:
         name = tool_entry.get("name", "unknown")
@@ -403,43 +351,39 @@ def _register_tools():
         sandbox_execution = tool_entry.get("sandbox_execution", True)
         module = tool_entry.get("module", "unknown")
 
-        allowed, reason = _is_tool_allowed(name)
-        if not allowed:
-            logger.debug(f"Skipping tool '{name}': {reason}")
-            skipped_count += 1
-            continue
-
+        # Get param schema for validation
         param_schema = _get_param_schema(name)
-        handler = _make_handler(name, param_schema, sandbox_execution)
-        mcp.add_tool(handler, name=f"strix_{name}", description=f"[{module}] {description}")
-        registered_count += 1
 
-    logger.info(f"Registered {registered_count} Strix tools as MCP tools ({skipped_count} skipped)")
+        # Create handler via closure (no exec)
+        handler = _make_handler(name, param_schema, sandbox_execution)
+
+        mcp.add_tool(handler, name=f"strix_{name}", description=f"[{module}] {description}")
+
+    logger.info(f"Registered {len(registry)} Strix tools as MCP tools")
 
 
 # ── MCP Resources ──────────────────────────────────────────────────────
 @mcp.resource("strix://tools/list")
 async def list_tools() -> str:
-    """List all Strix tools with exposure status."""
+    """List all available Strix tools with their categories and descriptions."""
     registry = _load_registry()
 
     if not registry:
-        return json.dumps({"tools": [], "message": "No tools available"}, indent=2)
+        return json.dumps(
+            {"tools": [], "message": "No tools available (registry not loaded)"},
+            indent=2,
+        )
 
     tools_by_module: dict[str, list[dict]] = {}
     for entry in registry:
         module = entry.get("module", "unknown")
         if module not in tools_by_module:
             tools_by_module[module] = []
-        name = entry.get("name", "")
-        allowed, reason = _is_tool_allowed(name)
         tools_by_module[module].append(
             {
-                "name": name,
+                "name": entry.get("name"),
                 "sandbox": entry.get("sandbox_execution", True),
                 "description": _parse_xml_description(entry.get("xml_schema", "")),
-                "exposed": allowed,
-                "exposure_reason": reason if not allowed else None,
             }
         )
 
@@ -450,15 +394,11 @@ async def list_tools() -> str:
 async def get_config() -> str:
     """Current Strix MCP server configuration."""
     config = {
-        "version": "0.2.0a1",
         "sandbox_url": SANDBOX_URL or "(not configured)",
         "sandbox_token": "..." + SANDBOX_TOKEN[-8:] if len(SANDBOX_TOKEN) > 8 else "(not set)",
         "sandbox_agent_id": SANDBOX_AGENT_ID,
         "strix_repo": str(STRIX_REPO),
         "sandbox_mode": os.getenv("STRIX_SANDBOX_MODE", "false"),
-        "force_blocked_tools": list(_FORCE_BLOCKED_TOOLS),
-        "allowlist": list(_ALLOWED_TOOLS) if _ALLOWED_TOOLS else None,
-        "force_blocked_override": list(_FORCE_BLOCKED_OVERRIDE_SET) if _FORCE_BLOCKED_OVERRIDE_SET else None,
     }
     return json.dumps(config, indent=2)
 
@@ -466,7 +406,13 @@ async def get_config() -> str:
 # ── MCP Prompts ────────────────────────────────────────────────────────
 @mcp.prompt()
 async def pentest_recon(target: str, tool: str = "all") -> str:
-    """Generate a reconnaissance workflow for a target."""
+    """
+    Generate a reconnaissance workflow for a target.
+
+    Args:
+        target: Target IP or domain to scan.
+        tool: Specific tool to use, or 'all' for full recon suite.
+    """
     tool_line = (
         f"Usa especificamente la herramienta: {tool}" if tool != "all" else "Usa todas las herramientas disponibles"
     )
@@ -486,7 +432,12 @@ Ejecuta las herramientas en orden y reporta los hallazgos."""
 
 @mcp.prompt()
 async def vuln_scan_target(target: str) -> str:
-    """Generate a vulnerability scanning workflow."""
+    """
+    Generate a vulnerability scanning workflow.
+
+    Args:
+        target: Target to scan.
+    """
     return f"""Eres un agente Strix ejecutando escaneo de vulnerabilidades contra {target}.
 
 Workflow:
@@ -500,10 +451,6 @@ Ejecuta en orden y reporta vulnerabilidades encontradas."""
 
 
 # ── Init ───────────────────────────────────────────────────────────────
-# _register_tools() is called inside main() — lazy loading.
-# Importing this module will NOT load the Strix registry.
-
-
 def main():
     """Entry point. Registers tools on startup (lazy load)."""
     _register_tools()

@@ -18,13 +18,18 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 # ── Paths ──────────────────────────────────────────────────────────────
-STRIX_REPO = Path(os.getenv("STRIX_REPO", "/home/jesus/.openclaw/workspace/strix"))
+STRIX_REPO = Path(os.getenv("STRIX_REPO", "./strix"))  # Path to Strix repo (set env var)
 sys.path.insert(0, str(STRIX_REPO))
 
 # ── Config ─────────────────────────────────────────────────────────────
 SANDBOX_URL = os.getenv("STRIX_SANDBOX_TOOL_SERVER_URL", "")
 SANDBOX_TOKEN = os.getenv("STRIX_SANDBOX_TOKEN", "")
 SANDBOX_AGENT_ID = os.getenv("STRIX_SANDBOX_AGENT_ID", "default")
+
+# ── Rate limiting ──────────────────────────────────────────────────────
+_rate_limit_window: dict[str, list[float]] = {}
+_RATE_LIMIT_MAX = 100  # requests per window
+_RATE_LIMIT_WINDOW = 60  # seconds
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("strix-mcp")
@@ -57,9 +62,7 @@ def _load_registry() -> list[dict[str, Any]]:
         _REGISTRY_CACHE = tools  # type: ignore[list-item]
         return _REGISTRY_CACHE
     except ImportError as e:
-        logger.warning(
-            f"Strix registry not importable (expected if running outside sandbox): {e}"
-        )
+        logger.warning(f"Strix registry not importable (expected if running outside sandbox): {e}")
         _REGISTRY_CACHE = []
         return []
 
@@ -131,6 +134,53 @@ def _get_param_schema(tool_name: str) -> dict[str, Any] | None:
         return None
 
 
+def _sanitize_param_value(value: Any, expected_type: str) -> Any:
+    """Sanitize a parameter value to expected type."""
+    if value is None:
+        return None
+    if expected_type == "string":
+        return str(value) if not isinstance(value, str) else value
+    if expected_type == "integer":
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return 0
+    if expected_type == "number":
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return 0.0
+    if expected_type == "boolean":
+        if isinstance(value, bool):
+            return value
+        return str(value).lower() in ("true", "1", "yes")
+    if expected_type == "array":
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                import json
+
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                return [value] if value else []
+    if expected_type == "object":
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                import json
+
+                parsed = json.loads(value)
+                if isinstance(parsed, dict):
+                    return parsed
+            except (json.JSONDecodeError, TypeError):
+                return {}
+    return value
+
+
 def _get_param_type(func: Any, param_name: str) -> str:
     """Infer JSON schema type from Python function signature."""
     try:
@@ -160,6 +210,23 @@ def _get_param_type(func: Any, param_name: str) -> str:
     return "string"
 
 
+# ── Rate limiting ──────────────────────────────────────────────────────
+def _check_rate_limit(tool_name: str) -> bool:
+    """Check if tool call is within rate limit. Returns True if allowed."""
+    import time
+
+    now = time.time()
+    key = f"tool:{tool_name}"
+    if key not in _rate_limit_window:
+        _rate_limit_window[key] = []
+    # Clean old entries
+    _rate_limit_window[key] = [t for t in _rate_limit_window[key] if now - t < _RATE_LIMIT_WINDOW]
+    if len(_rate_limit_window[key]) >= _RATE_LIMIT_MAX:
+        return False
+    _rate_limit_window[key].append(now)
+    return True
+
+
 # ── Execution layer ────────────────────────────────────────────────────
 async def _execute_sandbox(tool_name: str, kwargs: dict[str, Any]) -> Any:
     """Execute a tool via the Strix sandbox ToolServer (HTTP)."""
@@ -167,6 +234,13 @@ async def _execute_sandbox(tool_name: str, kwargs: dict[str, Any]) -> Any:
         raise RuntimeError("STRIX_SANDBOX_TOOL_SERVER_URL not configured")
     if not SANDBOX_TOKEN:
         raise RuntimeError("STRIX_SANDBOX_TOKEN not configured")
+
+    if not _check_rate_limit(tool_name):
+        return {
+            "error": "rate_limited",
+            "message": f"Rate limit: {_RATE_LIMIT_MAX} requests per {_RATE_LIMIT_WINDOW}s",
+            "retry_after_seconds": _RATE_LIMIT_WINDOW,
+        }
 
     import httpx
 
@@ -227,17 +301,13 @@ def _register_tools():
     registry = _load_registry()
 
     if not registry:
-        logger.info(
-            "No Strix tools found in registry. Server will expose discovery tools only."
-        )
+        logger.info("No Strix tools found in registry. Server will expose discovery tools only.")
         return
 
     for tool_entry in registry:
         name = tool_entry.get("name", "unknown")
         xml_schema = tool_entry.get("xml_schema", "")
-        description = (
-            _parse_xml_description(xml_schema) if xml_schema else f"Strix tool: {name}"
-        )
+        description = _parse_xml_description(xml_schema) if xml_schema else f"Strix tool: {name}"
         sandbox_execution = tool_entry.get("sandbox_execution", True)
         module = tool_entry.get("module", "unknown")
 
@@ -254,9 +324,7 @@ def _register_tools():
             param_sig = 'input: "dict" = {}'
 
         if param_names:
-            kwargs_build = (
-                "kwargs = {" + ", ".join(f'"{p}": {p}' for p in param_names) + "}"
-            )
+            kwargs_build = "kwargs = {" + ", ".join(f'"{p}": {p}' for p in param_names) + "}"
         else:
             kwargs_build = "kwargs = dict(input)"
 
@@ -350,9 +418,7 @@ async def get_config() -> str:
     """Current Strix MCP server configuration."""
     config = {
         "sandbox_url": SANDBOX_URL or "(not configured)",
-        "sandbox_token": "..." + SANDBOX_TOKEN[-8:]
-        if len(SANDBOX_TOKEN) > 8
-        else "(not set)",
+        "sandbox_token": "..." + SANDBOX_TOKEN[-8:] if len(SANDBOX_TOKEN) > 8 else "(not set)",
         "sandbox_agent_id": SANDBOX_AGENT_ID,
         "strix_repo": str(STRIX_REPO),
         "sandbox_mode": os.getenv("STRIX_SANDBOX_MODE", "false"),
@@ -371,9 +437,7 @@ async def pentest_recon(target: str, tool: str = "all") -> str:
         tool: Specific tool to use, or 'all' for full recon suite.
     """
     tool_line = (
-        f"Usa especificamente la herramienta: {tool}"
-        if tool != "all"
-        else "Usa todas las herramientas disponibles"
+        f"Usa especificamente la herramienta: {tool}" if tool != "all" else "Usa todas las herramientas disponibles"
     )
     return f"""Eres un agente Strix ejecutando reconocimiento contra {target}.
 

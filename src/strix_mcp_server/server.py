@@ -135,7 +135,7 @@ def _get_param_schema(tool_name: str) -> dict[str, Any] | None:
 
 
 def _sanitize_param_value(value: Any, expected_type: str) -> Any:
-    """Sanitize a parameter value to expected type. Raises on invalid coercion."""
+    """Sanitize a parameter value to expected type. Raises ValueError on invalid coercion."""
     if value is None:
         return None
     if expected_type == "string":
@@ -163,7 +163,8 @@ def _sanitize_param_value(value: Any, expected_type: str) -> Any:
                 if isinstance(parsed, list):
                     return parsed
             except (json.JSONDecodeError, TypeError):
-                return [value] if value else []
+                raise ValueError(f"Expected array, got invalid JSON string: {value!r}")
+        return [value] if value else []
     if expected_type == "object":
         if isinstance(value, dict):
             return value
@@ -173,7 +174,8 @@ def _sanitize_param_value(value: Any, expected_type: str) -> Any:
                 if isinstance(parsed, dict):
                     return parsed
             except (json.JSONDecodeError, TypeError):
-                return {}
+                raise ValueError(f"Expected object, got invalid JSON string: {value!r}")
+        return {}
     return value
 
 
@@ -291,6 +293,48 @@ async def _execute_local(tool_entry: dict[str, Any], kwargs: dict[str, Any]) -> 
     return result
 
 
+# ── Generic handler factory (replaces exec()) ─────────────────────────
+def _make_handler(tool_name: str, param_schema: dict[str, Any] | None, sandbox: bool) -> Any:
+    """Create a tool handler without exec(). Uses closure to capture metadata."""
+
+    async def handler(**kwargs: Any) -> dict[str, Any]:
+        """Execute a Strix tool via MCP."""
+        logger.info(f"Executing tool '{tool_name}' via MCP (sandbox={sandbox}, kwargs={list(kwargs.keys())})")
+
+        # Validate required params
+        if param_schema and param_schema.get("has_params"):
+            required = param_schema.get("required", set())
+            for req_param in required:
+                if req_param not in kwargs or kwargs.get(req_param) in (None, ""):
+                    return {
+                        "success": False,
+                        "tool": tool_name,
+                        "error": f"Missing required parameter: {req_param}",
+                    }
+
+        try:
+            if sandbox:
+                result = await _execute_sandbox(tool_name, kwargs)
+            else:
+                result = await _execute_local(_TOOL_ENTRIES.get(tool_name, {}), kwargs)
+
+            return {
+                "success": True,
+                "tool": tool_name,
+                "result": str(result) if result else "No result",
+            }
+        except Exception as e:
+            logger.error(f"Tool {tool_name} failed: {e}")
+            return {
+                "success": False,
+                "tool": tool_name,
+                "error": str(e),
+            }
+
+    handler.__name__ = f"strix_{tool_name.replace('-', '_').replace('.', '_')}"
+    return handler
+
+
 # ── MCP Tools ──────────────────────────────────────────────────────────
 def _register_tools():
     """Register all Strix tools as MCP tools."""
@@ -310,73 +354,10 @@ def _register_tools():
         # Get param schema for validation
         param_schema = _get_param_schema(name)
 
-        # Build dynamic handler with proper signature via exec
-        param_names = []
-        if param_schema and param_schema.get("has_params"):
-            param_names = sorted(param_schema.get("params", set()))
+        # Create handler via closure (no exec)
+        handler = _make_handler(name, param_schema, sandbox_execution)
 
-        param_sig = ", ".join(f'{p}: str = ""' for p in param_names)
-        if not param_sig:
-            param_sig = 'input: "dict" = {}'
-
-        if param_names:
-            kwargs_build = "kwargs = {" + ", ".join(f'"{p}": {p}' for p in param_names) + "}"
-        else:
-            kwargs_build = "kwargs = dict(input)"
-
-        handler_code = f'''
-async def handler({param_sig}):
-    """Execute a Strix tool via MCP."""
-    {kwargs_build}
-    logger.info(
-        f"Executing tool \'{name}\' via MCP (sandbox={sandbox_execution}, kwargs={{list(kwargs.keys())}})"
-    )
-
-    # Validate required params
-    ps = {repr(param_schema)}
-    if ps and ps.get("has_params"):
-        required = ps.get("required", set())
-        for req_param in required:
-            if req_param not in kwargs or kwargs.get(req_param) in (None, ""):
-                return {{
-                    "success": False,
-                    "tool": "{name}",
-                    "error": f"Missing required parameter: {{req_param}}",
-                }}
-
-    try:
-        if {sandbox_execution}:
-            result = await _execute_sandbox("{name}", kwargs)
-        else:
-            result = await _execute_local(_TOOL_ENTRIES.get("{name}", {{}}), kwargs)
-
-        return {{
-            "success": True,
-            "tool": "{name}",
-            "result": str(result) if result else "No result",
-        }}
-    except Exception as e:
-        logger.error(f"Tool {name} failed: {{e}}")
-        return {{
-            "success": False,
-            "tool": "{name}",
-            "error": str(e),
-        }}
-'''
-        local_ns: dict = {}
-        exec(
-            handler_code,
-            {
-                "_execute_sandbox": _execute_sandbox,
-                "_execute_local": _execute_local,
-                "logger": logger,
-                "_TOOL_ENTRIES": _TOOL_ENTRIES,
-            },
-            local_ns,
-        )
-        handler = local_ns["handler"]
-        handler.__name__ = f"strix_{name.replace('-', '_').replace('.', '_')}"
-        mcp.add_tool(handler, description=f"[{module}] {description}")
+        mcp.add_tool(handler, name=f"strix_{name}", description=f"[{module}] {description}")
 
     logger.info(f"Registered {len(registry)} Strix tools as MCP tools")
 
@@ -470,11 +451,9 @@ Ejecuta en orden y reporta vulnerabilidades encontradas."""
 
 
 # ── Init ───────────────────────────────────────────────────────────────
-_register_tools()
-
-
 def main():
-    """Entry point."""
+    """Entry point. Registers tools on startup (lazy load)."""
+    _register_tools()
     mcp.run()
 
 

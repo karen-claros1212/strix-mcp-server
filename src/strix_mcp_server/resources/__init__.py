@@ -1,0 +1,1 @@
+# Strix MCP Server — Resources

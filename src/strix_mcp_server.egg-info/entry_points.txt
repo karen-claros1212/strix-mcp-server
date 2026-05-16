@@ -1,0 +1,2 @@
+[console_scripts]
+strix-mcp = strix_mcp_server.server:main

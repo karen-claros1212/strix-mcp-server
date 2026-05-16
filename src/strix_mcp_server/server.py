@@ -135,7 +135,7 @@ def _get_param_schema(tool_name: str) -> dict[str, Any] | None:
 
 
 def _sanitize_param_value(value: Any, expected_type: str) -> Any:
-    """Sanitize a parameter value to expected type."""
+    """Sanitize a parameter value to expected type. Raises on invalid coercion."""
     if value is None:
         return None
     if expected_type == "string":
@@ -144,12 +144,12 @@ def _sanitize_param_value(value: Any, expected_type: str) -> Any:
         try:
             return int(value)
         except (ValueError, TypeError):
-            return 0
+            raise ValueError(f"Expected integer, got {type(value).__name__}: {value!r}")
     if expected_type == "number":
         try:
             return float(value)
         except (ValueError, TypeError):
-            return 0.0
+            raise ValueError(f"Expected number, got {type(value).__name__}: {value!r}")
     if expected_type == "boolean":
         if isinstance(value, bool):
             return value
@@ -159,8 +159,6 @@ def _sanitize_param_value(value: Any, expected_type: str) -> Any:
             return value
         if isinstance(value, str):
             try:
-                import json
-
                 parsed = json.loads(value)
                 if isinstance(parsed, list):
                     return parsed
@@ -171,8 +169,6 @@ def _sanitize_param_value(value: Any, expected_type: str) -> Any:
             return value
         if isinstance(value, str):
             try:
-                import json
-
                 parsed = json.loads(value)
                 if isinstance(parsed, dict):
                     return parsed
